@@ -327,6 +327,9 @@ class BeamSearchDecoderOnlyOutput(ModelOutput):
     beam_indices: Optional[torch.LongTensor] = None
     attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    beam_outputs_list: Optional[List] = None
+    next_token_scores_processed_list: Optional[List] = None
+
 
 
 @dataclass
@@ -377,6 +380,8 @@ class BeamSearchEncoderDecoderOutput(ModelOutput):
     decoder_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     cross_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     decoder_hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    beam_outputs_list: Optional[List] = None
+    next_token_scores_processed_list: Optional[List] = None
 
 
 @dataclass
@@ -3060,6 +3065,9 @@ class GenerationMixin:
         beam_scores = beam_scores.view((batch_size * num_beams,))
 
         this_peer_finished = False  # used by synced_gpus only
+
+        beam_outputs_list = []
+        next_token_scores_processed_list = []
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -3090,6 +3098,7 @@ class GenerationMixin:
             )  # (batch_size * num_beams, vocab_size)
 
             next_token_scores_processed = logits_processor(input_ids, next_token_scores)
+            next_token_scores_processed_list.append(next_token_scores_processed)
             next_token_scores = next_token_scores_processed + beam_scores[:, None].expand_as(
                 next_token_scores_processed
             )
@@ -3135,7 +3144,7 @@ class GenerationMixin:
                 eos_token_id=eos_token_id,
                 beam_indices=beam_indices,
             )
-
+            beam_outputs_list.append(beam_outputs)
             beam_scores = beam_outputs["next_beam_scores"]
             beam_next_tokens = beam_outputs["next_beam_tokens"]
             beam_idx = beam_outputs["next_beam_indices"]
@@ -3186,6 +3195,8 @@ class GenerationMixin:
                     decoder_attentions=decoder_attentions,
                     cross_attentions=cross_attentions,
                     decoder_hidden_states=decoder_hidden_states,
+                    beam_outputs_list=beam_outputs_list,
+                    next_token_scores_processed_list=next_token_scores_processed_list,
                 )
             else:
                 return BeamSearchDecoderOnlyOutput(
@@ -3195,6 +3206,8 @@ class GenerationMixin:
                     beam_indices=sequence_outputs["beam_indices"],
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
+                    beam_outputs_list=beam_outputs_list,
+                    next_token_scores_processed_list=next_token_scores_processed_list,
                 )
         else:
             return sequence_outputs["sequences"]
