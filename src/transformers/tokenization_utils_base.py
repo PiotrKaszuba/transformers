@@ -3711,6 +3711,31 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
             for seq in sequences
         ]
 
+
+    def batch_decode_raw(
+        self,
+        sequences: Union[List[int], List[List[int]], "np.ndarray", "torch.Tensor", "tf.Tensor"],
+        skip_special_tokens: bool = False,
+        **kwargs,
+    ) -> List[List[str]]:
+
+        return [
+            self.decode_raw(
+                seq,
+                skip_special_tokens=skip_special_tokens,
+                **kwargs,
+            )
+            for seq in sequences
+        ]
+
+    def decode_raw(
+            self,
+            token_ids: List[int],
+            skip_special_tokens: bool = False,
+            **kwargs,
+    ) -> List[str]:
+        raise NotImplementedError
+
     def decode(
         self,
         token_ids: Union[int, List[int], "np.ndarray", "torch.Tensor", "tf.Tensor"],

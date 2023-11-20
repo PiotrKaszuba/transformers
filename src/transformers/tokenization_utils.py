@@ -1038,3 +1038,63 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
             return clean_text
         else:
             return text
+
+    def _decode_raw(
+        self,
+        token_ids: List[int],
+        skip_special_tokens: bool = False,
+        **kwargs,
+        ) -> List[str]:
+        filtered_tokens = self.convert_ids_to_tokens(token_ids, skip_special_tokens=skip_special_tokens)
+        return filtered_tokens
+
+    def _decode_further(
+            self,
+            filtered_tokens: List[str],
+            skip_special_tokens: bool = False,
+            clean_up_tokenization_spaces: bool = None,
+            spaces_between_special_tokens: bool = True,
+            **kwargs,
+        ) -> str:
+
+        legacy_added_tokens = set(self._added_tokens_encoder.keys()) - set(self.all_special_tokens) | {
+            token for token in self.additional_special_tokens if self.convert_tokens_to_ids(token) >= self.vocab_size
+        }
+        # To avoid mixing byte-level and unicode for byte-level BPT
+        # we need to build string separately for added tokens and byte-level tokens
+        # cf. https://github.com/huggingface/transformers/issues/1133
+        sub_texts = []
+        current_sub_text = []
+        # TODO @ArthurZ in version 5, special tokens should be handled in convert_tokens_to_string, while _convert_tokens_to_string
+        for token in filtered_tokens:
+            if skip_special_tokens and token in self.all_special_ids:
+                continue
+            if token in legacy_added_tokens:
+                if current_sub_text:
+                    string = self.convert_tokens_to_string(current_sub_text)
+                    if len(string) > 0:
+                        sub_texts.append(string)
+                    current_sub_text = []
+                sub_texts.append(token)
+            else:
+                current_sub_text.append(token)
+        if current_sub_text:
+            sub_texts.append(self.convert_tokens_to_string(current_sub_text))
+
+        if spaces_between_special_tokens:
+            text = " ".join(sub_texts)
+        else:
+            text = "".join(sub_texts)
+
+        clean_up_tokenization_spaces = (
+            clean_up_tokenization_spaces
+            if clean_up_tokenization_spaces is not None
+            else self.clean_up_tokenization_spaces
+        )
+        if clean_up_tokenization_spaces:
+            clean_text = self.clean_up_tokenization(text)
+            return clean_text
+        else:
+            return text
+
+
