@@ -1503,6 +1503,11 @@ class DetrForObjectDetection(DetrPreTrainedModel):
         self.class_labels_classifier = nn.Linear(
             config.d_model, config.num_labels + 1
         )  # We add one for the "no object" class
+
+        self._other_categories_classifiers = nn.ModuleList(
+            [nn.Linear(config.d_model, num) for c, num in config.other_categories_num_classes.items()]
+        )
+
         self.bbox_predictor = DetrMLPPredictionHead(
             input_dim=config.d_model, hidden_dim=config.d_model, output_dim=4, num_layers=3
         )
@@ -1596,6 +1601,12 @@ class DetrForObjectDetection(DetrPreTrainedModel):
 
         # class logits + predicted bounding boxes
         logits = self.class_labels_classifier(sequence_output)
+
+
+        logits_other_categories = {
+            c: clf(sequence_output) for c, clf in zip(self.config.other_categories_num_classes.keys(), self._other_categories_classifiers)
+        }
+
         pred_boxes = self.bbox_predictor(sequence_output).sigmoid()
 
         loss, loss_dict, auxiliary_outputs = None, None, None

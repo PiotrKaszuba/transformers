@@ -15,7 +15,7 @@
 """ DETR model configuration"""
 
 from collections import OrderedDict
-from typing import Mapping
+from typing import Mapping, Dict
 
 from packaging import version
 
@@ -174,6 +174,8 @@ class DetrConfig(PretrainedConfig):
         bbox_loss_coefficient=5,
         giou_loss_coefficient=2,
         eos_coefficient=0.1,
+        other_categories_num_classes: Dict[str, int] = None,
+        other_categories_loss_coefficient: Dict[str, float] = None,
         **kwargs,
     ):
         if backbone_config is not None and use_timm_backbone:
@@ -225,6 +227,14 @@ class DetrConfig(PretrainedConfig):
         self.bbox_loss_coefficient = bbox_loss_coefficient
         self.giou_loss_coefficient = giou_loss_coefficient
         self.eos_coefficient = eos_coefficient
+
+        if other_categories_num_classes is None:
+            other_categories_num_classes = {}
+        if other_categories_loss_coefficient is None:
+            other_categories_loss_coefficient = {}
+        self.other_categories_num_classes = other_categories_num_classes
+        self.other_categories_loss_coefficient = other_categories_loss_coefficient
+
         super().__init__(is_encoder_decoder=is_encoder_decoder, **kwargs)
 
     @property
