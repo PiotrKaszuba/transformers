@@ -745,6 +745,9 @@ class PretrainedConfig(PushToHubMixin):
         if "_commit_hash" in kwargs and "_commit_hash" in config_dict:
             kwargs["_commit_hash"] = config_dict["_commit_hash"]
 
+        if '_additional_config_keys' in kwargs:
+            config_dict = {**config_dict, **kwargs.pop('_additional_config_keys')}
+
         config = cls(**config_dict)
 
         if hasattr(config, "pruned_heads"):
