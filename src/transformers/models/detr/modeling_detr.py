@@ -192,6 +192,9 @@ class DetrObjectDetectionOutput(ModelOutput):
     encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
 
+    logits_other_categories: Optional[Dict[str, torch.FloatTensor]] = None
+    non_category_variables: Optional[torch.FloatTensor] = None
+
 
 @dataclass
 class DetrSegmentationOutput(ModelOutput):
@@ -1484,6 +1487,24 @@ class DetrModel(DetrPreTrainedModel):
             intermediate_hidden_states=decoder_outputs.intermediate_hidden_states,
         )
 
+# class SelectiveBatchNorm(nn.Module):
+#     def __init__(self, num_features, indices_to_normalize, eps=1e-5, momentum=0.1, affine=True):
+#         super().__init__()
+#         self.indices_to_normalize = indices_to_normalize
+#         self.batch_norm = nn.BatchNorm1d(num_features=len(indices_to_normalize), eps=eps, momentum=momentum, affine=affine)
+#
+#     def forward(self, x):
+#         # Extract the parts to be normalized
+#         normalized_part = x[:, self.indices_to_normalize]
+#
+#         # Apply batch normalization
+#         normalized_part = self.batch_norm(normalized_part)
+#
+#         # Insert the normalized parts back into the original tensor
+#         output = x.clone()
+#         output[:, self.indices_to_normalize] = normalized_part
+#
+#         return output
 
 @add_start_docstrings(
     """
@@ -1505,8 +1526,17 @@ class DetrForObjectDetection(DetrPreTrainedModel):
         )  # We add one for the "no object" class
 
         self._other_categories_classifiers = nn.ModuleList(
-            [nn.Linear(config.d_model, num) for c, num in config.other_categories_num_classes.items()]
+            [nn.Linear(config.d_model, num + 1) for c, num in config.other_categories_num_classes.items()]
         )
+        self._non_category_variables_predictors = nn.Linear(config.d_model, len(config.non_category_variables)) if len(config.non_category_variables) > 0 else None
+        # self._non_category_variables_do_batch_norm_indices = [i for i, v in enumerate(config.non_category_variables.values()) if v.do_batch_norm()]
+        # self._non_category_variable_selective_batch_norms = SelectiveBatchNorm(
+        #     num_features=len(config.non_category_variables),
+        #     indices_to_normalize=self._non_category_variables_do_batch_norm_indices,
+        #     eps=1e-5,
+        #     momentum=0.1,
+        #     affine=True
+        # )
 
         self.bbox_predictor = DetrMLPPredictionHead(
             input_dim=config.d_model, hidden_dim=config.d_model, output_dim=4, num_layers=3
@@ -1537,6 +1567,7 @@ class DetrForObjectDetection(DetrPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple[torch.FloatTensor], DetrObjectDetectionOutput]:
         r"""
         labels (`List[Dict]` of len `(batch_size,)`, *optional*):
@@ -1607,6 +1638,11 @@ class DetrForObjectDetection(DetrPreTrainedModel):
             c: clf(sequence_output) for c, clf in zip(self.config.other_categories_num_classes.keys(), self._other_categories_classifiers)
         }
 
+        if self._non_category_variables_predictors is not None:
+            non_category_variables = self._non_category_variables_predictors(sequence_output)
+        else:
+            non_category_variables = None
+
         pred_boxes = self.bbox_predictor(sequence_output).sigmoid()
 
         loss, loss_dict, auxiliary_outputs = None, None, None
@@ -1616,18 +1652,23 @@ class DetrForObjectDetection(DetrPreTrainedModel):
                 class_cost=self.config.class_cost, bbox_cost=self.config.bbox_cost, giou_cost=self.config.giou_cost
             )
             # Second: create the criterion
-            losses = ["labels", "boxes", "cardinality"]
+            losses = ["labels", "boxes", "cardinality", "other_categories", "non_category_variables"]
             criterion = DetrLoss(
                 matcher=matcher,
                 num_classes=self.config.num_labels,
                 eos_coef=self.config.eos_coefficient,
                 losses=losses,
+                other_categories_num_classes=self.config.other_categories_num_classes,
+                non_category_variables=list(self.config.non_category_variables.keys()),
             )
             criterion.to(self.device)
             # Third: compute the losses, based on outputs and labels
             outputs_loss = {}
             outputs_loss["logits"] = logits
             outputs_loss["pred_boxes"] = pred_boxes
+            outputs_loss["logits_other_categories"] = logits_other_categories
+            if self._non_category_variables_predictors is not None:
+                outputs_loss["non_category_variables"] = non_category_variables
             if self.config.auxiliary_loss:
                 intermediate = outputs.intermediate_hidden_states if return_dict else outputs[4]
                 outputs_class = self.class_labels_classifier(intermediate)
@@ -1639,6 +1680,10 @@ class DetrForObjectDetection(DetrPreTrainedModel):
             # Fourth: compute total loss, as a weighted sum of the various losses
             weight_dict = {"loss_ce": 1, "loss_bbox": self.config.bbox_loss_coefficient}
             weight_dict["loss_giou"] = self.config.giou_loss_coefficient
+            for cat, coef in self.config.other_categories_loss_coefficients.items():
+                weight_dict[f"loss_ce_{cat}"] = coef
+            if self._non_category_variables_predictors is not None:
+                weight_dict["loss_non_category_variables"] = self.config.non_category_variables_loss_coefficient
             if self.config.auxiliary_loss:
                 aux_weight_dict = {}
                 for i in range(self.config.decoder_layers - 1):
@@ -1666,7 +1711,10 @@ class DetrForObjectDetection(DetrPreTrainedModel):
             encoder_last_hidden_state=outputs.encoder_last_hidden_state,
             encoder_hidden_states=outputs.encoder_hidden_states,
             encoder_attentions=outputs.encoder_attentions,
+            logits_other_categories=logits_other_categories,
+            non_category_variables=non_category_variables,
         )
+
 
 
 @add_start_docstrings(
@@ -2066,6 +2114,13 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
     return loss.mean(1).sum() / num_boxes
 
 
+class WeightedMSELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, inputs, targets, weights):
+        return (((inputs - targets)**2) * weights).mean()
+
+
 # taken from https://github.com/facebookresearch/detr/blob/master/models/detr.py
 class DetrLoss(nn.Module):
     """
@@ -2092,7 +2147,7 @@ class DetrLoss(nn.Module):
             List of all the losses to be applied. See `get_loss` for a list of all available losses.
     """
 
-    def __init__(self, matcher, num_classes, eos_coef, losses):
+    def __init__(self, matcher, num_classes, eos_coef, losses, other_categories_num_classes: Dict[str, int], non_category_variables: List[str]):
         super().__init__()
         self.matcher = matcher
         self.num_classes = num_classes
@@ -2101,6 +2156,19 @@ class DetrLoss(nn.Module):
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
+
+        for cat, num_class in other_categories_num_classes.items():
+            empty_weight = torch.ones(num_class + 1)
+            empty_weight[-1] = self.eos_coef
+            self.register_buffer(f"empty_weight_{cat}", empty_weight)
+
+        self.other_categories_empty_weight = {cat: getattr(self, f"empty_weight_{cat}") for cat in other_categories_num_classes.keys()}
+        self.non_category_variables_list = non_category_variables
+        self.other_categories_num_classes = other_categories_num_classes
+
+        self.current_empty_weight = self.empty_weight
+        self.current_num_classes = self.num_classes
+        self.mse_critertion = WeightedMSELoss()
 
     # removed logging parameter, which was part of the original implementation
     def loss_labels(self, outputs, targets, indices, num_boxes):
@@ -2115,11 +2183,11 @@ class DetrLoss(nn.Module):
         idx = self._get_source_permutation_idx(indices)
         target_classes_o = torch.cat([t["class_labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(
-            source_logits.shape[:2], self.num_classes, dtype=torch.int64, device=source_logits.device
+            source_logits.shape[:2], self.current_num_classes, dtype=torch.int64, device=source_logits.device
         )
         target_classes[idx] = target_classes_o
 
-        loss_ce = nn.functional.cross_entropy(source_logits.transpose(1, 2), target_classes, self.empty_weight)
+        loss_ce = nn.functional.cross_entropy(source_logits.transpose(1, 2), target_classes, self.current_empty_weight)
         losses = {"loss_ce": loss_ce}
 
         return losses
@@ -2209,12 +2277,52 @@ class DetrLoss(nn.Module):
         target_idx = torch.cat([target for (_, target) in indices])
         return batch_idx, target_idx
 
+
+    def loss_other_categories(self, outputs, targets, indices, num_boxes):
+        losses = {}
+        for other_cat, logits in outputs['logits_other_categories'].items():
+            outputs_temp = {'logits': logits}
+            targets_temp = [{'class_labels': t[other_cat]} for t in targets]
+            self.current_empty_weight = self.other_categories_empty_weight[other_cat]
+            self.current_num_classes = self.other_categories_num_classes[other_cat]
+            loss = self.loss_labels(outputs_temp, targets_temp, indices, num_boxes)
+            loss = {k + f"_{other_cat}": v for k, v in loss.items()}
+            losses.update(loss)
+        self.current_empty_weight = self.empty_weight
+        self.current_num_classes = self.num_classes
+        return losses
+
+    def loss_non_category_variables(self, outputs, targets, indices, num_boxes):
+        # collect targets
+        # non_cat_var_targets = torch.stack([torch.cat([t[non_cat_variable] for t in targets])
+        #                        for non_cat_variable in self.non_category_variables_names], dim=-1)
+        source_preds = outputs['non_category_variables']
+        idx = self._get_source_permutation_idx(indices)
+        target_classes_o = torch.cat([
+            torch.stack([
+                t[non_cat_variable][J] for non_cat_variable in self.non_category_variables_list], dim=-1)
+            for t, (_, J) in zip(targets, indices)])
+
+        target_classes = torch.full(
+            source_preds.shape, 0.0, dtype=target_classes_o.dtype, device=source_preds.device
+        )
+        target_classes[idx] = target_classes_o
+
+        weights = torch.ones_like(target_classes) * self.eos_coef
+        weights[idx] = 1.0
+
+        non_category_variables_loss = self.mse_critertion(source_preds, target_classes, weights)
+        losses = {"loss_non_category_variables": non_category_variables_loss}
+        return losses
+
     def get_loss(self, loss, outputs, targets, indices, num_boxes):
         loss_map = {
             "labels": self.loss_labels,
             "cardinality": self.loss_cardinality,
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
+            "other_categories": self.loss_other_categories,
+            "non_category_variables": self.loss_non_category_variables,
         }
         if loss not in loss_map:
             raise ValueError(f"Loss {loss} not supported")
@@ -2247,6 +2355,8 @@ class DetrLoss(nn.Module):
 
         # Compute all the requested losses
         losses = {}
+        self.current_empty_weight = self.empty_weight
+        self.other_categories_empty_weight = {cat: getattr(self, f"empty_weight_{cat}") for cat in self.other_categories_num_classes.keys()}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
 
