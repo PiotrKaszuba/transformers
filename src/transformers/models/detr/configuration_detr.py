@@ -32,6 +32,23 @@ DETR_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     # See all DETR models at https://huggingface.co/models?filter=detr
 }
 
+# VariableType
+class VariableType:
+    regression = 'regression'
+
+class Variable:
+    def __init__(self, name: str, variable_type: str):
+        self.name = name
+        self.variable_type = variable_type
+
+    def do_batch_norm(self) -> bool:
+        if self.variable_type == VariableType.regression:
+            return True
+        else:
+            return False
+
+
+
 
 class DetrConfig(PretrainedConfig):
     r"""
@@ -176,6 +193,8 @@ class DetrConfig(PretrainedConfig):
         eos_coefficient=0.1,
         other_categories_num_classes: Dict[str, int] = None,
         other_categories_loss_coefficient: Dict[str, float] = None,
+        non_category_variables: Dict[str, str] = None,
+        non_category_variables_loss_coefficient: float = 0.5,
         **kwargs,
     ):
         if backbone_config is not None and use_timm_backbone:
@@ -234,7 +253,8 @@ class DetrConfig(PretrainedConfig):
             other_categories_loss_coefficient = {}
         self.other_categories_num_classes = other_categories_num_classes
         self.other_categories_loss_coefficient = other_categories_loss_coefficient
-
+        self.non_category_variables: Dict[str, str] = non_category_variables
+        self.non_category_variables_loss_coefficient = non_category_variables_loss_coefficient
         super().__init__(is_encoder_decoder=is_encoder_decoder, **kwargs)
 
     @property
