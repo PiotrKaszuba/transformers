@@ -196,6 +196,38 @@ class DetrObjectDetectionOutput(ModelOutput):
     non_category_variables: Optional[torch.FloatTensor] = None
 
 
+    def move_to_cpu(self) -> "DetrObjectDetectionOutput":
+        return DetrObjectDetectionOutput(
+            loss=self.loss.cpu() if self.loss is not None else None,
+            loss_dict=self.loss_dict,
+            logits=self.logits.cpu() if self.logits is not None else None,
+            pred_boxes=self.pred_boxes.cpu() if self.pred_boxes is not None else None,
+            auxiliary_outputs=self.auxiliary_outputs,
+            last_hidden_state=self.last_hidden_state.cpu() if self.last_hidden_state is not None else None,
+            decoder_hidden_states=tuple(h.cpu() if h is not None else None for h in self.decoder_hidden_states)
+            if self.decoder_hidden_states is not None
+            else None,
+            decoder_attentions=tuple(a.cpu() if a is not None else None for a in self.decoder_attentions)
+            if self.decoder_attentions is not None
+            else None,
+            cross_attentions=tuple(a.cpu() if a is not None else None for a in self.cross_attentions)
+            if self.cross_attentions is not None
+            else None,
+            encoder_last_hidden_state=self.encoder_last_hidden_state.cpu()
+            if self.encoder_last_hidden_state is not None
+            else None,
+            encoder_hidden_states=tuple(h.cpu() if h is not None else None for h in self.encoder_hidden_states)
+            if self.encoder_hidden_states is not None
+            else None,
+            encoder_attentions=tuple(a.cpu() if a is not None else None for a in self.encoder_attentions)
+            if self.encoder_attentions is not None
+            else None,
+            logits_other_categories={k: v.cpu() for k, v in self.logits_other_categories.items()} if self.logits_other_categories is not None else None,
+            non_category_variables=self.non_category_variables.cpu() if self.non_category_variables is not None else None,
+        )
+
+
+
 @dataclass
 class DetrSegmentationOutput(ModelOutput):
     """
