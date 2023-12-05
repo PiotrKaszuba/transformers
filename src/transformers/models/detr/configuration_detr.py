@@ -35,6 +35,7 @@ DETR_PRETRAINED_CONFIG_ARCHIVE_MAP = {
 # VariableType
 class VariableType:
     regression = 'regression'
+    binary = 'binary'
 
 class Variable:
     def __init__(self, name: str, variable_type: str):
@@ -195,6 +196,10 @@ class DetrConfig(PretrainedConfig):
         other_categories_loss_coefficient: Dict[str, float] = None,
         non_category_variables: Dict[str, str] = None,
         non_category_variables_loss_coefficient: float = 0.5,
+        main_category_additional_layers: int = 0,
+        other_categories_additional_layers: int = 0,
+        non_category_variables_additional_layers: int = 0,
+        num_objects_loss_power_factor: float = 0.0,
         **kwargs,
     ):
         if backbone_config is not None and use_timm_backbone:
@@ -253,8 +258,14 @@ class DetrConfig(PretrainedConfig):
             other_categories_loss_coefficient = {}
         self.other_categories_num_classes = other_categories_num_classes
         self.other_categories_loss_coefficient = other_categories_loss_coefficient
-        self.non_category_variables: Dict[str, str] = non_category_variables
+        self.non_category_variables: Dict[str, str] = {} if non_category_variables is None else non_category_variables
         self.non_category_variables_loss_coefficient = non_category_variables_loss_coefficient
+
+        self.main_category_additional_layers = main_category_additional_layers
+        self.other_categories_additional_layers = other_categories_additional_layers
+        self.non_category_variables_additional_layers = non_category_variables_additional_layers
+        self.num_objects_loss_power_factor = num_objects_loss_power_factor
+
         super().__init__(is_encoder_decoder=is_encoder_decoder, **kwargs)
 
     @property
