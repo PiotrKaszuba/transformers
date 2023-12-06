@@ -15,7 +15,7 @@
 """ DETR model configuration"""
 
 from collections import OrderedDict
-from typing import Mapping, Dict
+from typing import Mapping, Dict, List
 
 from packaging import version
 
@@ -36,6 +36,15 @@ DETR_PRETRAINED_CONFIG_ARCHIVE_MAP = {
 class VariableType:
     regression = 'regression'
     binary = 'binary'
+    unit_interval = 'unit_interval'
+    signed_unit_interval = 'signed_unit_interval'
+
+VariableTypeToDefaultValue = {
+    VariableType.regression: 0.0,
+    VariableType.binary: 0.5,
+    VariableType.unit_interval: 0.5,
+    VariableType.signed_unit_interval: 0.0,
+}
 
 class Variable:
     def __init__(self, name: str, variable_type: str):
@@ -196,10 +205,26 @@ class DetrConfig(PretrainedConfig):
         other_categories_loss_coefficient: Dict[str, float] = None,
         non_category_variables: Dict[str, str] = None,
         non_category_variables_loss_coefficient: float = 0.5,
-        main_category_additional_layers: int = 0,
-        other_categories_additional_layers: int = 0,
-        non_category_variables_additional_layers: int = 0,
+
+        relation_variables: List[str] = None,
+        relation_variables_loss_coefficient: float = 0.5,
+
+        position_variables: List[str] = None,
+
+        num_additional_layers: int = 0,
+        num_positional_layers: int = 0,
+        num_non_positional_layers: int = 0,
+        num_category_layers: int = 0,
+        num_non_category_layers: int = 0,
+        num_relational_layers: int = 0,
+
+        num_position_attention_heads: int = 8,
+
         num_objects_loss_power_factor: float = 0.0,
+        object_area_loss_power_factor: float = 0.0,
+        object_sample_weight_power_factor: float = 0.0,
+        example_sample_weight_power_factor: float = 0.0,
+
         **kwargs,
     ):
         if backbone_config is not None and use_timm_backbone:
@@ -261,10 +286,23 @@ class DetrConfig(PretrainedConfig):
         self.non_category_variables: Dict[str, str] = {} if non_category_variables is None else non_category_variables
         self.non_category_variables_loss_coefficient = non_category_variables_loss_coefficient
 
-        self.main_category_additional_layers = main_category_additional_layers
-        self.other_categories_additional_layers = other_categories_additional_layers
-        self.non_category_variables_additional_layers = non_category_variables_additional_layers
+        self.relation_variables: List[str] = [] if relation_variables is None else relation_variables
+        self.relation_variables_loss_coefficient = relation_variables_loss_coefficient
+
+        self.position_variables: List[str] = [] if position_variables is None else position_variables
+
+        self.num_additional_layers = num_additional_layers
+        self.num_positional_layers = num_positional_layers
+        self.num_non_positional_layers = num_non_positional_layers
+        self.num_category_layers = num_category_layers
+        self.num_non_category_layers = num_non_category_layers
+        self.num_relational_layers = num_relational_layers
+        self.num_position_attention_heads = num_position_attention_heads
         self.num_objects_loss_power_factor = num_objects_loss_power_factor
+        self.object_area_loss_power_factor = object_area_loss_power_factor
+
+        self.object_sample_weight_power_factor = object_sample_weight_power_factor
+        self.example_sample_weight_power_factor = example_sample_weight_power_factor
 
         super().__init__(is_encoder_decoder=is_encoder_decoder, **kwargs)
 

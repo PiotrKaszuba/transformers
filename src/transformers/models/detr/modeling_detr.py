@@ -37,8 +37,7 @@ from ...utils import (
     requires_backends,
 )
 from ..auto import AutoBackbone
-from .configuration_detr import DetrConfig
-
+from .configuration_detr import DetrConfig, VariableTypeToDefaultValue
 
 if is_scipy_available():
     from scipy.optimize import linear_sum_assignment
@@ -194,6 +193,7 @@ class DetrObjectDetectionOutput(ModelOutput):
 
     logits_other_categories: Optional[Dict[str, torch.FloatTensor]] = None
     non_category_variables: Optional[torch.FloatTensor] = None
+    relation_variables: Optional[torch.FloatTensor] = None
 
 
     def move_to_cpu(self) -> "DetrObjectDetectionOutput":
@@ -224,6 +224,7 @@ class DetrObjectDetectionOutput(ModelOutput):
             else None,
             logits_other_categories={k: v.cpu() for k, v in self.logits_other_categories.items()} if self.logits_other_categories is not None else None,
             non_category_variables=self.non_category_variables.cpu() if self.non_category_variables is not None else None,
+            relation_variables=self.relation_variables.cpu() if self.relation_variables is not None else None,
         )
 
 
@@ -595,7 +596,7 @@ class DetrAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
-        position_embeddings = kwargs.pop("position_ebmeddings", None)
+        position_embeddings = kwargs.pop("position_embeddings", None)
         key_value_position_embeddings = kwargs.pop("key_value_position_embeddings", None)
 
         if kwargs:
@@ -629,13 +630,13 @@ class DetrAttention(nn.Module):
         batch_size, target_len, embed_dim = hidden_states.size()
 
         # add position embeddings to the hidden states before projecting to queries and keys
+        hidden_states_original = hidden_states
         if object_queries is not None:
-            hidden_states_original = hidden_states
             hidden_states = self.with_pos_embed(hidden_states, object_queries)
 
         # add key-value position embeddings to the key value states
+        key_value_states_original = key_value_states
         if spatial_position_embeddings is not None:
-            key_value_states_original = key_value_states
             key_value_states = self.with_pos_embed(key_value_states, spatial_position_embeddings)
 
         # get query proj
@@ -1560,7 +1561,39 @@ class DetrForObjectDetection(DetrPreTrainedModel):
         self._other_categories_classifiers = nn.ModuleList(
             [nn.Linear(config.d_model, num + 1) for c, num in config.other_categories_num_classes.items()]
         )
-        self._non_category_variables_predictors = nn.Linear(config.d_model, len(config.non_category_variables)) if len(config.non_category_variables) > 0 else None
+
+        self.num_position_attention_heads = config.num_position_attention_heads
+
+        self.additional_layers = DetrFFN(config.d_model, config.d_model, config.d_model, config.num_additional_layers,
+                                         nn.functional.silu) if config.num_additional_layers else None
+
+        self.all_features = list(config.other_categories_num_classes.keys()) + list(
+            config.non_category_variables.keys()) + config.relation_variables
+        self.relation_variables = config.relation_variables
+        self.position_features = config.position_variables + [r for r in self.relation_variables if
+                                                              r not in config.position_variables]
+        self.position_category_features = [f for f in self.position_features if
+                                           f in set(self.position_features).intersection(
+                                               config.other_categories_num_classes.keys())]
+        self.position_non_category_features = [f for f in self.position_features if
+                                               f in set(self.position_features).intersection(
+                                                   config.non_category_variables.keys())]
+
+        self.non_position_features = [f for f in self.all_features if f not in self.position_features]
+
+        # main category is always non position category too but not included in this list
+        self.non_position_category_features = [f for f in self.non_position_features if
+                                               f in set(self.non_position_features).intersection(
+                                                   config.other_categories_num_classes.keys())]
+
+        self.non_position_non_category_features = [f for f in self.non_position_features if
+                                                   f in set(self.non_position_features).intersection(
+                                                       config.non_category_variables.keys())]
+
+        # for backwards compatibility this is for non-position non-category variables
+        self._non_category_variables_predictors = nn.Linear(config.d_model, len(self.non_position_non_category_features)) if len(self.non_position_non_category_features) > 0 else None
+        self._non_category_position_variables_predictors = nn.Linear(config.d_model, len(self.position_non_category_features)) if len(self.position_non_category_features) > 0 else None
+
         # self._non_category_variables_do_batch_norm_indices = [i for i, v in enumerate(config.non_category_variables.values()) if v.do_batch_norm()]
         # self._non_category_variable_selective_batch_norms = SelectiveBatchNorm(
         #     num_features=len(config.non_category_variables),
@@ -1573,6 +1606,43 @@ class DetrForObjectDetection(DetrPreTrainedModel):
         self.bbox_predictor = DetrMLPPredictionHead(
             input_dim=config.d_model, hidden_dim=config.d_model, output_dim=4, num_layers=3
         )
+
+
+
+        self.position_layers = DetrFFN(config.d_model, config.d_model, config.d_model, config.num_positional_layers,
+                                         nn.functional.silu) if config.num_positional_layers and len(self.position_features) > 0 else None
+
+        self.position_category_layers = DetrFFN(config.d_model, config.d_model, config.d_model, config.num_category_layers,
+                                        nn.functional.silu) if config.num_category_layers and len(self.position_category_features) > 0 else None
+
+        self.position_non_category_layers = DetrFFN(config.d_model, config.d_model, config.d_model, config.num_non_category_layers,
+                                        nn.functional.silu) if config.num_non_category_layers and len(self.position_non_category_features) > 0 else None
+
+        self.non_position_layers = DetrFFN(config.d_model, config.d_model, config.d_model, config.num_non_positional_layers,
+                                         nn.functional.silu) if config.num_non_positional_layers else None
+
+        self.non_position_category_layers = DetrFFN(config.d_model, config.d_model, config.d_model, config.num_category_layers,
+                                        nn.functional.silu) if config.num_category_layers else None
+
+        self.non_position_non_category_layers = DetrFFN(config.d_model, config.d_model, config.d_model, config.num_non_category_layers,
+                                        nn.functional.silu) if config.num_non_category_layers and len(self.non_position_non_category_features) > 0 else None
+
+        self.relation_layers = DetrFFN(
+            input_dim=self.num_position_attention_heads,
+            hidden_dim=self.num_position_attention_heads,
+            output_dim=len(self.relation_variables),
+            num_layers=config.num_relational_layers,
+            activation=nn.functional.silu,
+            last_activation=nn.functional.sigmoid,
+        ) if config.num_relational_layers and len(self.relation_variables) > 0 else None
+
+        self.position_attention = DetrAttention(config.d_model, self.num_position_attention_heads, config.attention_dropout) if len(self.relation_variables) > 0 else None
+
+        self.variable_type_to_activation = {
+            'regression': nn.Identity(),
+            'unit_interval': nn.Sigmoid(),
+            'signed_unit_interval': nn.Tanh(),
+        }
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1662,20 +1732,67 @@ class DetrForObjectDetection(DetrPreTrainedModel):
 
         sequence_output = outputs[0]
 
+        sequence_output = (sequence_output + self.additional_layers(sequence_output)) if self.additional_layers is not None else sequence_output
+
+        non_position_states = (sequence_output + self.non_position_layers(sequence_output)) if self.non_position_layers is not None else sequence_output
+
+        non_position_category_states = (non_position_states + self.non_position_category_layers(non_position_states)) if self.non_position_category_layers is not None else non_position_states
+        non_position_non_category_states = (non_position_states + self.non_position_non_category_layers(non_position_states)) if self.non_position_non_category_layers is not None else non_position_states
+
+        position_states, attn_weights = self.position_attention(sequence_output, output_attentions=True) if self.position_attention is not None else (None, None)
+
+        position_states = (position_states + sequence_output) if position_states is not None else sequence_output
+        position_states = (position_states + self.position_layers(position_states)) if self.position_layers is not None else position_states
+
+        position_category_states = (position_states + self.position_category_layers(position_states)) if self.position_category_layers is not None else position_states
+        position_non_category_states = (position_states + self.position_non_category_layers(position_states)) if self.position_non_category_layers is not None else position_states
+
         # class logits + predicted bounding boxes
-        logits = self.class_labels_classifier(sequence_output)
+        logits = self.class_labels_classifier(non_position_category_states)
 
 
         logits_other_categories = {
-            c: clf(sequence_output) for c, clf in zip(self.config.other_categories_num_classes.keys(), self._other_categories_classifiers)
+            c: clf(non_position_category_states) if c in self.non_position_category_features else clf(position_category_states)
+            for c, clf in zip(self.config.other_categories_num_classes.keys(), self._other_categories_classifiers)
         }
 
         if self._non_category_variables_predictors is not None:
-            non_category_variables = self._non_category_variables_predictors(sequence_output)
+            non_category_variables = self._non_category_variables_predictors(non_position_non_category_states)
+            non_category_variables = torch.cat([self.variable_type_to_activation[vt](v) for v, vt in
+                                                         zip(non_category_variables.split(1, -1),
+                                                             {var: var_type for var, var_type in
+                                                              self.config.non_category_variables.items() if
+                                                              var in self.non_position_non_category_features}.values())],
+                                                        -1)
         else:
             non_category_variables = None
 
-        pred_boxes = self.bbox_predictor(sequence_output).sigmoid()
+        if self._non_category_position_variables_predictors is not None:
+            non_category_position_variables = self._non_category_position_variables_predictors(position_non_category_states)
+            non_category_position_variables = torch.cat([self.variable_type_to_activation[vt](v) for v, vt in
+                       zip(non_category_position_variables.split(1, -1),
+                           {var: var_type for var, var_type in self.config.non_category_variables.items() if
+                            var in self.position_non_category_features}.values())], -1)
+            if non_category_variables is not None:
+                tuple_of_non_cat_variables = non_category_variables.split(1, -1) + non_category_position_variables.split(1, -1)
+                position_index_start = non_category_variables.shape[-1]
+                non_category_variables = torch.cat([tuple_of_non_cat_variables[self.non_position_non_category_features.index(var)] if var in self.non_position_non_category_features else tuple_of_non_cat_variables[self.position_non_category_features.index(var)+position_index_start] for var in self.config.non_category_variables], -1)
+            else:
+                non_category_variables = non_category_position_variables
+        else:
+            non_category_position_variables = None
+            non_category_variables = non_category_variables
+
+        if self.relation_layers is not None:
+            attn_weights = attn_weights.transpose(1, 3).contiguous()
+            batch_size, seq_len = attn_weights.shape[:2]
+            attn_weights = attn_weights.view(batch_size * seq_len, seq_len, -1).contiguous()
+
+            relation_variables = self.relation_layers(attn_weights).view(batch_size, seq_len, seq_len, -1).contiguous()
+        else:
+            relation_variables = None
+
+        pred_boxes = self.bbox_predictor(position_states).sigmoid()
 
         loss, loss_dict, auxiliary_outputs = None, None, None
         if labels is not None:
@@ -1684,7 +1801,14 @@ class DetrForObjectDetection(DetrPreTrainedModel):
                 class_cost=self.config.class_cost, bbox_cost=self.config.bbox_cost, giou_cost=self.config.giou_cost
             )
             # Second: create the criterion
-            losses = ["labels", "boxes", "cardinality", "other_categories", "non_category_variables"]
+            losses = [
+                "labels",
+                "boxes",
+                "cardinality",
+            ] + \
+                     (["other_categories",] if len(logits_other_categories) > 0 else []) + \
+                     (["non_category_variables",] if non_category_variables is not None else []) + \
+                     (["relation_variables",] if relation_variables is not None else [])
             criterion = DetrLoss(
                 matcher=matcher,
                 num_classes=self.config.num_labels,
@@ -1692,15 +1816,21 @@ class DetrForObjectDetection(DetrPreTrainedModel):
                 losses=losses,
                 other_categories_num_classes=self.config.other_categories_num_classes,
                 non_category_variables=list(self.config.non_category_variables.keys()),
+                non_category_variables_defaults=[VariableTypeToDefaultValue[var_type] for var_type in self.config.non_category_variables.values()],
+                relation_variables=self.config.relation_variables,
+                relation_variables_defaults=[0.5] * len(self.config.relation_variables),
             )
             criterion.to(self.device)
             # Third: compute the losses, based on outputs and labels
             outputs_loss = {}
             outputs_loss["logits"] = logits
             outputs_loss["pred_boxes"] = pred_boxes
-            outputs_loss["logits_other_categories"] = logits_other_categories
-            if self._non_category_variables_predictors is not None:
+            if len(logits_other_categories) > 0:
+                outputs_loss["logits_other_categories"] = logits_other_categories
+            if non_category_variables is not None:
                 outputs_loss["non_category_variables"] = non_category_variables
+            if relation_variables is not None:
+                outputs_loss["relation_variables"] = relation_variables
             if self.config.auxiliary_loss:
                 intermediate = outputs.intermediate_hidden_states if return_dict else outputs[4]
                 outputs_class = self.class_labels_classifier(intermediate)
@@ -1714,8 +1844,10 @@ class DetrForObjectDetection(DetrPreTrainedModel):
             weight_dict["loss_giou"] = self.config.giou_loss_coefficient
             for cat, coef in self.config.other_categories_loss_coefficients.items():
                 weight_dict[f"loss_ce_{cat}"] = coef
-            if self._non_category_variables_predictors is not None:
+            if non_category_variables is not None:
                 weight_dict["loss_non_category_variables"] = self.config.non_category_variables_loss_coefficient
+            if relation_variables is not None:
+                weight_dict["loss_relation_variables"] = self.config.relation_variables_loss_coefficient
             if self.config.auxiliary_loss:
                 aux_weight_dict = {}
                 for i in range(self.config.decoder_layers - 1):
@@ -1745,6 +1877,7 @@ class DetrForObjectDetection(DetrPreTrainedModel):
             encoder_attentions=outputs.encoder_attentions,
             logits_other_categories=logits_other_categories,
             non_category_variables=non_category_variables,
+            relation_variables=relation_variables,
         )
 
 
@@ -2179,7 +2312,7 @@ class DetrLoss(nn.Module):
             List of all the losses to be applied. See `get_loss` for a list of all available losses.
     """
 
-    def __init__(self, matcher, num_classes, eos_coef, losses, other_categories_num_classes: Dict[str, int], non_category_variables: List[str]):
+    def __init__(self, matcher, num_classes, eos_coef, losses, other_categories_num_classes: Dict[str, int], non_category_variables: List[str], non_category_variables_defaults: List[float], relation_variables: List[str], relation_variables_defaults: List[float]):
         super().__init__()
         self.matcher = matcher
         self.num_classes = num_classes
@@ -2196,7 +2329,10 @@ class DetrLoss(nn.Module):
 
         self.other_categories_empty_weight = {cat: getattr(self, f"empty_weight_{cat}") for cat in other_categories_num_classes.keys()}
         self.non_category_variables_list = non_category_variables
+        self.non_category_variables_defaults = non_category_variables_defaults
         self.other_categories_num_classes = other_categories_num_classes
+        self.relation_variables_list = relation_variables
+        self.relation_variables_defaults = relation_variables_defaults
 
         self.current_empty_weight = self.empty_weight
         self.current_num_classes = self.num_classes
@@ -2338,6 +2474,7 @@ class DetrLoss(nn.Module):
         target_classes = torch.full(
             source_preds.shape, 0.0, dtype=target_classes_o.dtype, device=source_preds.device
         )
+        target_classes[..., :] = torch.tensor(self.non_category_variables_defaults, dtype=target_classes.dtype, device=source_preds.device)
         target_classes[idx] = target_classes_o
 
         weights = torch.ones_like(target_classes) * self.eos_coef
@@ -2345,6 +2482,29 @@ class DetrLoss(nn.Module):
 
         non_category_variables_loss = self.mse_critertion(source_preds, target_classes, weights)
         losses = {"loss_non_category_variables": non_category_variables_loss}
+        return losses
+
+    def loss_relation_variables(self, outputs, targets, indices, num_boxes):
+        source_preds = outputs['relation_variables']
+        idx = self._get_source_permutation_idx(indices)
+        target_classes_o = [torch.stack([t[rel_var][J] for rel_var in self.relation_variables_list], -1)
+                            for t, (_, J) in zip(targets, indices)]
+
+        target_classes = torch.full(
+            source_preds.shape, 0.0, dtype=source_preds.dtype, device=source_preds.device
+        )
+        target_classes[..., :] = torch.tensor(self.relation_variables_defaults, dtype=target_classes.dtype, device=source_preds.device)
+        weights = torch.ones_like(target_classes) * self.eos_coef**2
+
+        for i in range(len(target_classes_o)):
+            ex_idxs = idx[1][torch.where(idx[0] == i)]
+            idx_x, idx_y = torch.meshgrid(torch.tensor(ex_idxs), torch.tensor(ex_idxs), indexing='ij')
+            target_classes[i, idx_x, idx_y] = target_classes_o[i]
+            weights[i, idx_x, idx_y] = 1.0
+
+        loss_rel = nn.functional.binary_cross_entropy(source_preds, target_classes, weights)
+
+        losses = {"loss_relation_variables": loss_rel}
         return losses
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes):
@@ -2355,6 +2515,7 @@ class DetrLoss(nn.Module):
             "masks": self.loss_masks,
             "other_categories": self.loss_other_categories,
             "non_category_variables": self.loss_non_category_variables,
+            "relation_variables": self.loss_relation_variables,
         }
         if loss not in loss_map:
             raise ValueError(f"Loss {loss} not supported")
@@ -2428,6 +2589,23 @@ class DetrMLPPredictionHead(nn.Module):
             x = nn.functional.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
+class DetrFFN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, activation=nn.functional.relu, last_activation=None):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+        self.activation = activation
+        self.last_activation = last_activation
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < self.num_layers - 1:
+                x = self.activation(x)
+            elif self.last_activation is not None:
+                x = self.last_activation(x)
+
+        return x
 
 # taken from https://github.com/facebookresearch/detr/blob/master/models/matcher.py
 class DetrHungarianMatcher(nn.Module):
